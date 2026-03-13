@@ -1,0 +1,125 @@
+ARG PYTHON=312
+ARG INSTALL_FROM_GIT=true
+
+# Use a multi-stage build to create a lightweight production image
+
+FROM registry.access.redhat.com/ubi9/python-${PYTHON}-minimal AS builder
+
+USER root
+
+# Install system dependencies needed for some Python packages
+RUN microdnf install -y gcc python3-devel git && microdnf clean all
+
+# Copy requirements first
+COPY requirements.txt /tmp/requirements.txt
+
+# Create a venv and install dependencies
+RUN python3 -m venv /opt/app-root/guidellm \
+    && /opt/app-root/guidellm/bin/pip install --no-cache-dir --upgrade pip
+
+# Install GuideLLM based on build argument
+RUN if [ "$INSTALL_FROM_GIT" = "true" ]; then \
+        echo "Installing GuideLLM from git repository..." && \
+        /opt/app-root/guidellm/bin/pip install --no-cache-dir git+https://github.com/vllm-project/guidellm.git; \
+    else \
+        echo "Installing GuideLLM from PyPI..." && \
+        /opt/app-root/guidellm/bin/pip install --no-cache-dir guidellm; \
+    fi
+
+# Install Streamlit dependencies (excluding git+https line if installing from PyPI)
+RUN if [ "$INSTALL_FROM_GIT" = "true" ]; then \
+        /opt/app-root/guidellm/bin/pip install --no-cache-dir -r /tmp/requirements.txt; \
+    else \
+        grep -v "git+https://github.com/vllm-project/guidellm.git" /tmp/requirements.txt > /tmp/requirements-filtered.txt && \
+        /opt/app-root/guidellm/bin/pip install --no-cache-dir -r /tmp/requirements-filtered.txt; \
+    fi \
+    && rm -f /tmp/requirements.txt /tmp/requirements-filtered.txt
+
+# Set cache directory and pre-download common tokenizers to avoid runtime download issues
+ENV HF_HOME=/tmp/hf_cache \
+    TRANSFORMERS_CACHE=/tmp/hf_cache/transformers
+
+RUN mkdir -p /tmp/hf_cache && \
+    /opt/app-root/guidellm/bin/python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('gpt2')" && \
+    /opt/app-root/guidellm/bin/python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('microsoft/DialoGPT-medium')" || true
+
+# Production image
+FROM registry.access.redhat.com/ubi9/python-${PYTHON}-minimal
+
+USER root
+
+# Copy the virtual environment from the builder stage
+COPY --from=builder /opt/app-root/guidellm /opt/app-root/guidellm
+
+# Copy the pre-downloaded tokenizers cache
+COPY --from=builder /tmp/hf_cache /home/guidellm/.cache
+
+# Add guidellm bin to PATH
+ENV PATH="/opt/app-root/guidellm/bin:$PATH"
+
+# Create a non-root user and app directory
+RUN useradd -md /app guidellm && \
+    mkdir -p /app/results && \
+    mkdir -p /home/guidellm/.cache && \
+    chown -R guidellm:guidellm /app && \
+    chown -R guidellm:guidellm /home/guidellm/.cache
+
+# Copy the Streamlit web application
+COPY --chown=guidellm:guidellm app.py /app/
+COPY --chown=guidellm:guidellm requirements.txt /app/
+COPY --chown=guidellm:guidellm entrypoint.sh /app/
+
+# Make entrypoint script executable
+RUN chmod +x /app/entrypoint.sh
+
+# Switch to non-root user
+USER guidellm
+
+# Set working directory
+WORKDIR /app
+
+# Expose Streamlit default port
+EXPOSE 8501
+
+# Metadata
+LABEL org.opencontainers.image.source="https://github.com/neuralmagic/guidellm" \
+      org.opencontainers.image.description="GuideLLM Benchmark Workbench - Streamlit Web Interface" \
+      org.opencontainers.image.title="GuideLLM Workbench" \
+      org.opencontainers.image.vendor="Neural Magic"
+
+# Environment variables for Streamlit configuration
+ENV STREAMLIT_SERVER_PORT=8501 \
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    STREAMLIT_SERVER_HEADLESS=true \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+    STREAMLIT_SERVER_FILE_WATCHER_TYPE=none \
+    STREAMLIT_SERVER_ENABLE_CORS=false \
+    STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false
+
+# Environment variables for HuggingFace cache
+ENV HF_HOME=/home/guidellm/.cache \
+    TRANSFORMERS_CACHE=/home/guidellm/.cache/transformers
+
+# Default environment variables for GuideLLM (can be overridden)
+ENV GUIDELLM_TARGET="http://localhost:8000/v1" \
+    GUIDELLM_MODEL="llama-3.2-3b" \
+    GUIDELLM_RATE_TYPE="synchronous" \
+    GUIDELLM_MAX_REQUESTS="100" \
+    GUIDELLM_MAX_SECONDS="60"
+
+
+
+COPY templates/benchmark_compact_template.html /app/templates/benchmark_compact_template.html
+ENV TARGET_URL="http://localhost:4000/v1/"
+ENV API_KEY="sk-***"
+ENV HF_TOKEN="hf_***"
+
+ENV GUIDELLM__MP_CONTEXT_TYPE=fork
+ENV GUIDELLM__MAX_WORKER_PROCESSES=1
+
+
+# Health check to ensure the Streamlit app is running
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')" || exit 1
+
+ENTRYPOINT [ "/app/entrypoint.sh" ]
